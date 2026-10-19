@@ -1,17 +1,15 @@
 package com.example.metromap
 
 import android.Manifest
-import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Canvas
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
-import android.graphics.Paint
-import android.graphics.Point
+import android.os.Build
 import android.os.Bundle
-import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -19,11 +17,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -48,12 +49,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -61,10 +61,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import kotlinx.coroutines.CancellationException
+import coil.ImageLoader
+import coil.compose.AsyncImage
+import coil.decode.GifDecoder
+import coil.decode.ImageDecoderDecoder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -75,14 +77,13 @@ import org.osmdroid.tileprovider.tilesource.XYTileSource
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.CustomZoomButtonsController
 import org.osmdroid.views.MapView
-import org.osmdroid.views.overlay.Overlay
+import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
-import android.graphics.Color as AColor
 
 // ---- Metro palette ----
 private val MetroCyan = Color(0xFF00ABA9)
@@ -90,32 +91,58 @@ private val MetroBlue = Color(0xFF1BA1E2)
 private val MetroPurple = Color(0xFFA200FF)
 private val MetroOrange = Color(0xFFF09609)
 private val MetroMagenta = Color(0xFFD80073)
+private val MetroDark = Color(0xFF1F1F1F)
 
-// ---- Themes ----
-private enum class ThemeMode(val label: String) {
-    SYSTEM("системная"), LIGHT("светлая"), DARK("тёмная"), AMOLED("amoled")
+private const val USER_AGENT = "MetroMapApp/1.0 (com.example.metromap)"
+
+// ---- Темы ----
+private enum class ThemeMode(val key: String) {
+    DARK("dark"), LIGHT("light"), SYSTEM("system")
 }
 
-private class Palette(
-    val field: Color,
-    val fieldText: Color,
+private fun themeFromKey(key: String?): ThemeMode =
+    ThemeMode.values().firstOrNull { it.key == key } ?: ThemeMode.DARK // по умолчанию тёмная
+
+private class MetroColors(
+    val background: Color,
+    val onBackground: Color,
+    val muted: Color,
+    val inputBg: Color,
+    val inputText: Color,
     val hint: Color,
-    val border: Color,
-    val status: Color,
-    val dark: Boolean
+    val statusBg: Color,
+    val statusText: Color,
 )
 
-private val LightPalette = Palette(Color.White, Color.Black, Color(0xFF808080), Color.Transparent, Color(0xE6000000), false)
-private val DarkPalette = Palette(Color(0xFF2B2B2B), Color.White, Color(0xFF9A9A9A), Color.Transparent, Color(0xF2121212), true)
-private val AmoledPalette = Palette(Color.Black, Color.White, Color(0xFF8A8A8A), Color(0xFF5A5A5A), Color.Black, true)
+private val DarkColors = MetroColors(
+    background = Color(0xFF121212),
+    onBackground = Color.White,
+    muted = Color(0xFF9E9E9E),
+    inputBg = Color(0xFF2B2B2B),
+    inputText = Color.White,
+    hint = Color(0xFF8A8A8A),
+    statusBg = Color(0xE6000000),
+    statusText = Color.White,
+)
 
-// Инверсия цветов тайлов = тёмная карта
-private val InvertFilter = ColorMatrixColorFilter(
+private val LightColors = MetroColors(
+    background = Color(0xFFF2F2F2),
+    onBackground = Color(0xFF1F1F1F),
+    muted = Color(0xFF666666),
+    inputBg = Color.White,
+    inputText = Color.Black,
+    hint = Color.Gray,
+    statusBg = Color(0xE6FFFFFF),
+    statusText = Color(0xFF1F1F1F),
+)
+
+// Тёмная карта: invert + hue-rotate(180°). Белое -> чёрное, вода остаётся синей, парки зелёными.
+private val DarkTilesFilter = ColorMatrixColorFilter(
     ColorMatrix(
         floatArrayOf(
-            -1f, 0f, 0f, 0f, 255f,
-            0f, -1f, 0f, 0f, 255f,
-            0f, 0f, -1f, 0f, 255f,
+            0.574f, -1.430f, -0.144f, 0f, 255f,
+            -0.426f, -0.430f, -0.144f, 0f, 255f,
+            -0.426f, -1.430f, 0.856f, 0f, 255f,
             0f, 0f, 0f, 1f, 0f
         )
     )
@@ -133,49 +160,15 @@ private val OpenTopo = XYTileSource(
 
 private data class Place(val lat: Double, val lon: Double, val name: String)
 
-// Метка в стиле Metro: квадрат с белой рамкой (без Marker и его info-окна)
-private class PinOverlay(private val point: GeoPoint, private val density: Float) : Overlay() {
-    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = AColor.parseColor("#00ABA9") }
-    private val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = AColor.WHITE }
-    private val pt = Point()
-
-    override fun draw(canvas: Canvas, mapView: MapView, shadow: Boolean) {
-        if (shadow) return
-        mapView.projection.toPixels(point, pt)
-        val half = 14f * density
-        val b = 3f * density
-        canvas.drawRect(pt.x - half - b, pt.y - half - b, pt.x + half + b, pt.y + half + b, edge)
-        canvas.drawRect(pt.x - half, pt.y - half, pt.x + half, pt.y + half, fill)
-    }
-}
-
-private fun logCrash(file: File, e: Throwable) {
-    try {
-        file.writeText(Log.getStackTraceString(e))
-    } catch (_: Throwable) {
-    }
-}
-
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-
-        // Любая необработанная ошибка сохраняется и показывается при следующем запуске
-        val crashFile = File(filesDir, "crash.txt")
-        val previous = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { t, e ->
-            logCrash(crashFile, e)
-            previous?.uncaughtException(t, e)
+        Configuration.getInstance().apply {
+            userAgentValue = USER_AGENT
+            osmdroidBasePath = File(filesDir, "osmdroid").apply { mkdirs() }
+            osmdroidTileCache = File(cacheDir, "osmdroid_tiles").apply { mkdirs() }
         }
-
-        val osm = Configuration.getInstance()
-        osm.load(applicationContext, getSharedPreferences("osmdroid", Context.MODE_PRIVATE))
-        // OSM блокирует запросы тайлов без нормального User-Agent
-        osm.userAgentValue = "MetroMap/1.0 (https://github.com/c0rel5/metromap)"
-        osm.osmdroidBasePath = File(filesDir, "osmdroid").apply { mkdirs() }
-        osm.osmdroidTileCache = File(cacheDir, "osmdroid-tiles").apply { mkdirs() }
-
         setContent { MetroMapApp() }
     }
 }
@@ -185,52 +178,36 @@ fun MetroMapApp() {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
-    val view = LocalView.current
-    val clipboard = LocalClipboardManager.current
-    val prefs = remember { ctx.getSharedPreferences("settings", Context.MODE_PRIVATE) }
-    val crashFile = remember { File(ctx.filesDir, "crash.txt") }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focus = LocalFocusManager.current
+
+    // ---- тема (по умолчанию тёмная, выбор сохраняется) ----
+    val prefs = remember { ctx.getSharedPreferences("metromap_prefs", Context.MODE_PRIVATE) }
+    var themeMode by remember { mutableStateOf(themeFromKey(prefs.getString("theme", null))) }
+    val isDark = when (themeMode) {
+        ThemeMode.DARK -> true
+        ThemeMode.LIGHT -> false
+        ThemeMode.SYSTEM -> isSystemInDarkTheme()
+    }
+    val colors = if (isDark) DarkColors else LightColors
+    var showSettings by remember { mutableStateOf(false) }
+
+    // иконки статус-бара и навигации под тему
+    SideEffect {
+        val bars = if (isDark) {
+            SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        } else {
+            SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+        }
+        (ctx as? ComponentActivity)?.enableEdgeToEdge(statusBarStyle = bars, navigationBarStyle = bars)
+    }
 
     var mapView by remember { mutableStateOf<MapView?>(null) }
     var myLoc by remember { mutableStateOf<MyLocationNewOverlay?>(null) }
-    var pin by remember { mutableStateOf<PinOverlay?>(null) }
+    var marker by remember { mutableStateOf<Marker?>(null) }
     var topo by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var status by remember { mutableStateOf<String?>(null) }
-    var crashText by remember {
-        mutableStateOf(if (crashFile.exists()) runCatching { crashFile.readText() }.getOrNull() else null)
-    }
-    var themeMode by remember {
-        mutableStateOf(
-            ThemeMode.values().firstOrNull { it.name == prefs.getString("theme", null) } ?: ThemeMode.SYSTEM
-        )
-    }
-
-    val systemDark = isSystemInDarkTheme()
-    val palette = when (themeMode) {
-        ThemeMode.SYSTEM -> if (systemDark) DarkPalette else LightPalette
-        ThemeMode.LIGHT -> LightPalette
-        ThemeMode.DARK -> DarkPalette
-        ThemeMode.AMOLED -> AmoledPalette
-    }
-    val dark = palette.dark
-    val isTopo = topo
-
-    // иконки статус-бара под тему
-    SideEffect {
-        val window = (view.context as? Activity)?.window
-        if (window != null) {
-            val c = WindowCompat.getInsetsController(window, view)
-            c.isAppearanceLightStatusBars = !dark
-            c.isAppearanceLightNavigationBars = !dark
-        }
-    }
-
-    fun nextTheme() {
-        val all = ThemeMode.values()
-        themeMode = all[(themeMode.ordinal + 1) % all.size]
-        prefs.edit().putString("theme", themeMode.name).apply()
-        status = "тема: ${themeMode.label}"
-    }
 
     fun locate() {
         val m = mapView ?: return
@@ -257,9 +234,8 @@ fun MetroMapApp() {
                     }
                 }
             }
-        } catch (e: Throwable) {
-            logCrash(crashFile, e)
-            status = "ошибка геолокации: ${e.javaClass.simpleName}"
+        } catch (e: Exception) {
+            status = "не удалось определить местоположение"
         }
     }
 
@@ -284,49 +260,55 @@ fun MetroMapApp() {
     fun search() {
         val q = query.trim()
         if (q.isEmpty()) return
+        keyboard?.hide()
+        focus.clearFocus()
         scope.launch {
             status = "поиск…"
-            try {
-                val place = withContext(Dispatchers.IO) { geocode(q) }
-                val m = mapView
-                if (place == null || m == null) {
-                    status = "ничего не найдено (проверь интернет)"
-                } else {
+            val result = withContext(Dispatchers.IO) { runCatching { geocode(q) } }
+            val m = mapView
+            val place = result.getOrNull()
+            when {
+                result.isFailure -> status = "ошибка сети, попробуйте ещё раз"
+                place == null || m == null -> status = "ничего не найдено"
+                else -> try {
                     val point = GeoPoint(place.lat, place.lon)
-                    pin?.let { m.overlays.remove(it) }
-                    val newPin = PinOverlay(point, ctx.resources.displayMetrics.density)
-                    m.overlays.add(newPin)
-                    pin = newPin
+                    marker?.let { m.overlays.remove(it) }
+                    val newMarker = Marker(m).apply {
+                        position = point
+                        title = place.name
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    }
+                    m.overlays.add(newMarker)
+                    marker = newMarker
                     m.controller.setZoom(15.0)
                     m.controller.animateTo(point)
                     m.invalidate()
                     status = place.name
+                } catch (e: Exception) {
+                    status = "не удалось показать результат"
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Throwable) {
-                logCrash(crashFile, e)
-                status = "ошибка поиска: ${e.javaClass.simpleName}"
             }
         }
     }
 
+    // ВАЖНО: раньше в onDispose вызывался mapView?.onDetach(). Когда mapView менялся
+    // с null на созданную карту, старый эффект «умирал» и отсоединял уже новую карту
+    // (tile-провайдер останавливался) - карта оставалась пустой. Теперь view берётся
+    // в локальную переменную, а onDetach вызывается только при реальном уничтожении (onRelease).
     DisposableEffect(lifecycleOwner, mapView) {
+        val view = mapView
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_RESUME -> mapView?.onResume()
-                Lifecycle.Event.ON_PAUSE -> mapView?.onPause()
+                Lifecycle.Event.ON_RESUME -> view?.onResume()
+                Lifecycle.Event.ON_PAUSE -> view?.onPause()
                 else -> {}
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            mapView?.onDetach()
-        }
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    Box(Modifier.fillMaxSize().background(if (themeMode == ThemeMode.AMOLED) Color.Black else Color(0xFF1F1F1F))) {
+    Box(Modifier.fillMaxSize().background(MetroDark)) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { context ->
@@ -339,17 +321,18 @@ fun MetroMapApp() {
                     mapView = this
                 }
             },
-            update = { map ->
-                map.setTileSource(if (isTopo) OpenTopo else TileSourceFactory.MAPNIK)
-                val tiles = map.overlayManager.tilesOverlay
-                tiles.setColorFilter(if (dark) InvertFilter else null)
-                tiles.setLoadingBackgroundColor(if (dark) AColor.BLACK else 0xFFE6E6E6.toInt())
-                tiles.setLoadingLineColor(if (dark) 0xFF222222.toInt() else 0xFFD0D0D0.toInt())
-                map.invalidate()
-            }
+            update = { view ->
+                val wanted = if (topo) OpenTopo else TileSourceFactory.MAPNIK
+                if (view.tileProvider.tileSource.name() != wanted.name()) {
+                    view.setTileSource(wanted)
+                }
+                view.overlayManager.tilesOverlay.setColorFilter(if (isDark) DarkTilesFilter else null)
+                view.invalidate()
+            },
+            onRelease = { it.onDetach() }
         )
 
-        // ---- верх: поиск + тема ----
+        // ---- верх: поиск + настройки ----
         Column(
             Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(12.dp)
         ) {
@@ -358,16 +341,14 @@ fun MetroMapApp() {
                     value = query,
                     onValueChange = { query = it },
                     singleLine = true,
-                    textStyle = TextStyle(color = palette.fieldText, fontSize = 18.sp, fontWeight = FontWeight.Light),
-                    cursorBrush = SolidColor(palette.fieldText),
+                    textStyle = TextStyle(color = colors.inputText, fontSize = 18.sp, fontWeight = FontWeight.Light),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                     keyboardActions = KeyboardActions(onSearch = { search() }),
-                    modifier = Modifier.weight(1f).height(52.dp)
-                        .background(palette.field).border(2.dp, palette.border),
+                    modifier = Modifier.weight(1f).height(52.dp).background(colors.inputBg),
                     decorationBox = { inner ->
                         Box(Modifier.padding(horizontal = 14.dp), contentAlignment = Alignment.CenterStart) {
                             if (query.isEmpty()) {
-                                Text("поиск места", color = palette.hint, fontSize = 18.sp, fontWeight = FontWeight.Light)
+                                Text("поиск места", color = colors.hint, fontSize = 18.sp, fontWeight = FontWeight.Light)
                             }
                             inner()
                         }
@@ -380,20 +361,22 @@ fun MetroMapApp() {
                     Text("→", color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Light)
                 }
                 Box(
-                    Modifier.padding(start = 4.dp).size(52.dp).background(MetroPurple).clickable { nextTheme() },
+                    Modifier.padding(start = 4.dp).size(52.dp).background(MetroDark).clickable { showSettings = true },
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("◐", color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Light)
+                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        repeat(3) { Box(Modifier.size(22.dp, 3.dp).background(Color.White)) }
+                    }
                 }
             }
             status?.let {
                 Text(
                     it,
-                    color = Color.White,
+                    color = colors.statusText,
                     fontSize = 13.sp,
                     maxLines = 2,
                     modifier = Modifier.padding(top = 4.dp).fillMaxWidth()
-                        .background(palette.status).padding(10.dp)
+                        .background(colors.statusBg).padding(10.dp)
                 )
             }
         }
@@ -409,30 +392,117 @@ fun MetroMapApp() {
             Tile("▦", if (topo) "схема" else "рельеф", MetroMagenta, Modifier.weight(1f)) { topo = !topo }
         }
 
-        // ---- экран ошибки (если приложение раньше падало) ----
-        crashText?.let { text ->
-            Column(
-                Modifier.fillMaxSize().background(Color.Black)
-                    .statusBarsPadding().navigationBarsPadding().padding(12.dp)
-            ) {
-                Text("приложение закрылось с ошибкой", color = MetroOrange, fontSize = 18.sp)
-                Text(
-                    text,
-                    color = Color.White,
-                    fontSize = 11.sp,
-                    modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(vertical = 8.dp)
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Tile("□", "копировать", MetroBlue, Modifier.weight(1f)) {
-                        clipboard.setText(AnnotatedString(text))
-                    }
-                    Tile("×", "закрыть", MetroMagenta, Modifier.weight(1f)) {
-                        crashFile.delete()
-                        crashText = null
-                    }
-                }
+        // ---- настройки (поверх карты, карта остаётся живой) ----
+        if (showSettings) {
+            SettingsScreen(
+                colors = colors,
+                mode = themeMode,
+                onMode = {
+                    themeMode = it
+                    prefs.edit().putString("theme", it.key).apply()
+                },
+                onBack = { showSettings = false }
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsScreen(
+    colors: MetroColors,
+    mode: ThemeMode,
+    onMode: (ThemeMode) -> Unit,
+    onBack: () -> Unit,
+) {
+    val ctx = LocalContext.current
+    BackHandler(onBack = onBack)
+
+    val gifLoader = remember {
+        ImageLoader.Builder(ctx)
+            .components {
+                if (Build.VERSION.SDK_INT >= 28) add(ImageDecoderDecoder.Factory()) else add(GifDecoder.Factory())
+            }
+            .build()
+    }
+
+    Column(
+        Modifier.fillMaxSize()
+            .background(colors.background)
+            .pointerInput(Unit) { detectTapGestures { } } // не пускаем касания к карте под экраном
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 12.dp)
+    ) {
+        Box(
+            Modifier.size(48.dp).clickable(onClick = onBack),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            Text("←", color = colors.onBackground, fontSize = 28.sp, fontWeight = FontWeight.Light)
+        }
+        Text(
+            "настройки",
+            color = colors.onBackground,
+            fontSize = 40.sp,
+            fontWeight = FontWeight.Light,
+            modifier = Modifier.padding(top = 8.dp, bottom = 24.dp)
+        )
+
+        Text("тема", color = colors.muted, fontSize = 14.sp, modifier = Modifier.padding(bottom = 8.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            ThemeTile("тёмная", Color(0xFF2B2B2B), Color.White, mode == ThemeMode.DARK, colors, Modifier.weight(1f)) {
+                onMode(ThemeMode.DARK)
+            }
+            ThemeTile("светлая", Color(0xFFE6E6E6), Color(0xFF1F1F1F), mode == ThemeMode.LIGHT, colors, Modifier.weight(1f)) {
+                onMode(ThemeMode.LIGHT)
+            }
+            ThemeTile("как в системе", MetroBlue, Color.White, mode == ThemeMode.SYSTEM, colors, Modifier.weight(1f)) {
+                onMode(ThemeMode.SYSTEM)
             }
         }
+
+        Spacer(Modifier.height(40.dp))
+
+        // ---- конец настроек: ник и гифка ----
+        Text("автор", color = colors.muted, fontSize = 14.sp)
+        Text(
+            "corei5",
+            color = MetroCyan,
+            fontSize = 32.sp,
+            fontWeight = FontWeight.Light,
+            modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
+        )
+        AsyncImage(
+            model = R.raw.nekopara_chocola,
+            imageLoader = gifLoader,
+            contentDescription = "corei5",
+            modifier = Modifier.fillMaxWidth().aspectRatio(480f / 272f)
+        )
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun ThemeTile(
+    label: String,
+    fill: Color,
+    textColor: Color,
+    selected: Boolean,
+    colors: MetroColors,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier.height(76.dp)
+            .background(fill)
+            .then(if (selected) Modifier.border(3.dp, MetroCyan) else Modifier.border(1.dp, colors.muted))
+            .clickable(onClick = onClick)
+            .padding(8.dp)
+    ) {
+        if (selected) {
+            Text("✓", color = textColor, fontSize = 22.sp, modifier = Modifier.align(Alignment.TopStart))
+        }
+        Text(label, color = textColor, fontSize = 12.sp, modifier = Modifier.align(Alignment.BottomStart))
     }
 }
 
@@ -445,21 +515,24 @@ private fun Tile(glyph: String, label: String, color: Color, modifier: Modifier 
     }
 }
 
+// Бросает исключение при сетевой ошибке, возвращает null если ничего не найдено.
 private fun geocode(q: String): Place? {
-    val url = URL("https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" + URLEncoder.encode(q, "UTF-8"))
+    val url = URL(
+        "https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=ru&q=" +
+            URLEncoder.encode(q, "UTF-8")
+    )
     val conn = url.openConnection() as HttpURLConnection
     try {
-        conn.setRequestProperty("User-Agent", "MetroMap/1.0 (https://github.com/c0rel5/metromap)")
-        conn.setRequestProperty("Accept-Language", "ru")
+        conn.setRequestProperty("User-Agent", USER_AGENT)
         conn.connectTimeout = 8000
         conn.readTimeout = 8000
-        if (conn.responseCode != 200) return null
+        if (conn.responseCode != HttpURLConnection.HTTP_OK) {
+            throw java.io.IOException("HTTP " + conn.responseCode)
+        }
         val arr = JSONArray(conn.inputStream.bufferedReader().use { it.readText() })
         if (arr.length() == 0) return null
         val o = arr.getJSONObject(0)
-        return Place(o.getDouble("lat"), o.getDouble("lon"), o.getString("display_name"))
-    } catch (e: java.io.IOException) {
-        return null
+        return Place(o.getDouble("lat"), o.getDouble("lon"), o.optString("display_name", q))
     } finally {
         conn.disconnect()
     }
