@@ -326,7 +326,14 @@ fun MetroMapApp() {
                 if (view.tileProvider.tileSource.name() != wanted.name()) {
                     view.setTileSource(wanted)
                 }
-                view.overlayManager.tilesOverlay.setColorFilter(if (isDark) DarkTilesFilter else null)
+                view.overlayManager.tilesOverlay.apply {
+                    setColorFilter(if (isDark) DarkTilesFilter else null)
+                    // цвет ещё не загруженных плиток: в тёмной теме это цвет «суши» Mapnik,
+                    // после фильтра он сливается с картой (без коричневых квадратов)
+                    val loading = if (isDark) 0xFFF2EFE9.toInt() else android.graphics.Color.rgb(216, 208, 208)
+                    setLoadingBackgroundColor(loading)
+                    setLoadingLineColor(loading)
+                }
                 view.invalidate()
             },
             onRelease = { it.onDetach() }
@@ -477,6 +484,24 @@ private fun SettingsScreen(
             imageLoader = gifLoader,
             contentDescription = "corei5",
             modifier = Modifier.fillMaxWidth().aspectRatio(480f / 272f)
+        )
+
+        Spacer(Modifier.height(32.dp))
+
+        // ---- тестер ----
+        Text("тестер", color = colors.muted, fontSize = 14.sp)
+        Text(
+            "meoww",
+            color = MetroMagenta,
+            fontSize = 32.sp,
+            fontWeight = FontWeight.Light,
+            modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
+        )
+        AsyncImage(
+            model = R.raw.nekopara_vanilla,
+            imageLoader = gifLoader,
+            contentDescription = "meoww",
+            modifier = Modifier.fillMaxWidth(0.7f).aspectRatio(296f / 360f)
         )
         Spacer(Modifier.height(24.dp))
     }
